@@ -74,6 +74,16 @@ def fixxpath(root, xpath):
 def get_url_path(url):
     return urlparse(url.strip()).path
 
+import os
+from xml.sax.saxutils import escape as sax_utils_escape
+
+# Convert execute script into format compatible for dispatch over the REST API
+cust_script_char_conv = lambda script_str: sax_utils_escape(script_str).\
+replace(os.linesep, '&#13;').\
+replace('"', '&quot;').\
+replace('%', '&#37;').\
+replace("'", '&apos;')
+
 
 class Vdc(object):
     """
@@ -315,7 +325,7 @@ class VCloudConnection(ConnectionUserAndKey):
     responseCls = VCloudResponse
     token = None
     host = None
-
+    
     def request(self, *args, **kwargs):
         self._get_auth_token()
         return super(VCloudConnection, self).request(*args, **kwargs)
@@ -382,6 +392,13 @@ class VCloudNodeDriver(NodeDriver):
 
     def __new__(cls, key, secret=None, secure=True, host=None, port=None,
                 api_version=DEFAULT_API_VERSION, **kwargs):
+
+        # If no password is set, ConnectionUserAndKey omits it from the argument
+        # list such the argument order is shuffled up.  The hostname gets set to
+        # the port number!
+        if key is None:
+            raise TypeError('No password set')
+
         if cls is VCloudNodeDriver:
             if api_version == '0.8':
                 cls = VCloudNodeDriver
@@ -396,7 +413,7 @@ class VCloudNodeDriver(NodeDriver):
                     "No VCloudNodeDriver found for API version %s" %
                     (api_version))
         return super(VCloudNodeDriver, cls).__new__(cls)
-
+    
     @property
     def vdcs(self):
         """
@@ -936,6 +953,9 @@ class Instantiate_1_5_VAppXML(object):
         configuration = ET.SubElement(parent, 'Configuration')
         ET.SubElement(configuration, 'ParentNetwork',
                       {'href': self.network.get('href')})
+#        ET.SubElement(configuration, 'ParentNetwork',
+#                      {'href': self.network.get('href'),
+#                       'name': self.network.get('name')})
 
         if self.vm_fence is None:
             fencemode = self.network.find(fixxpath(self.network,
@@ -1925,7 +1945,7 @@ class VCloud_1_5_NodeDriver(VCloudNodeDriver):
             admin_pass = res.object.find(fixxpath(res.object, 'AdminPassword'))
             if admin_pass is not None:
                 res.object.remove(admin_pass)
-
+            
             # Update VM's GuestCustomizationSection
             headers = {
                 'Content-Type':
@@ -2104,3 +2124,83 @@ class VCloud_5_5_NodeDriver(VCloud_5_1_NodeDriver):
     Accept headers
     '''
     connectionCls = VCloud_5_5_Connection
+        
+    def _change_vm_script(self, vapp_or_vm_id, vm_script):
+        '''Set customisation script - format has changed for vCD 5.5 
+        incorporating changes in this version
+        '''
+        
+        if vm_script is None:
+            return
+
+        vms = self._get_vm_elements(vapp_or_vm_id)
+        try:
+            script = cust_script_char_conv(open(vm_script).read())
+            
+        except Exception:
+            return
+
+        # ElementTree escapes script characters automatically. Escape 
+        # requirements:
+        # http://www.vmware.com/support/vcd/doc/rest-api-doc-1.5-html/types/GuestCustomizationSectionType.html
+        for vm in vms:
+            # Get GuestCustomizationSection
+            res = self.connection.request(
+                '%s/guestCustomizationSection' % get_url_path(vm.get('href')))
+
+            # Attempt to update any existing CustomizationScript element
+            try:
+                res.object.find(
+                    fixxpath(res.object, 'CustomizationScript')).text = script
+            except Exception:
+                # CustomizationScript section does not exist, insert it just 
+                # before ComputerName
+                for i, e in enumerate(res.object):
+                    if (e.tag == 
+                            '{http://www.vmware.com/vcloud/v1.5}ComputerName'):
+                        break
+                    
+                e = ET.Element(
+                    '{http://www.vmware.com/vcloud/v1.5}CustomizationScript')
+                e.text = script
+                res.object.insert(i, e)
+
+            # Remove AdminPassword from customization section due to an API 
+            # quirk
+            admin_pass = res.object.find(fixxpath(res.object, 'AdminPassword'))
+            if admin_pass is not None:
+                res.object.remove(admin_pass)
+
+            # v5.5 fixes . . .
+            
+            # Disable admin password to avoid error:
+            #
+            # 'The administrator password cannot be empty when it is enabled 
+            #  and automatic password generation is not selected.'
+            admin_password_enabled_elem = res.object.find(
+                                fixxpath(res.object, 'AdminPasswordEnabled'))
+            if admin_password_enabled_elem is not None:
+                admin_password_enabled_elem.text = 'false'
+                
+            # Autologon must be set 0 if AutologonEnabled is set 'false'
+            admin_auto_logon_enabled_elem = res.object.find(
+                                fixxpath(res.object, 'AdminAutoLogonEnabled'))
+            
+            if (admin_auto_logon_enabled_elem is not None and
+                admin_auto_logon_enabled_elem.text.strip() == 'false'):
+                admin_auto_logon_count_elem = res.object.find(
+                                fixxpath(res.object, 'AdminAutoLogonCount'))
+                if admin_auto_logon_count_elem is not None:
+                    admin_auto_logon_count_elem.text = '0'
+            
+            # End v5.5 fixes
+            open('/Users/philipkershaw/vm_script3.out', 'w').write(ET.tostring(res.object, method='xml'))
+            # Update VM's GuestCustomizationSection
+            res = self.connection.request(
+                '%s/guestCustomizationSection' % get_url_path(vm.get('href')),
+                data=ET.tostring(res.object),
+                method='PUT',
+                headers={'Content-Type': 
+                'application/vnd.vmware.vcloud.guestCustomizationSection+xml'}
+            )
+            self._wait_for_task_completion(res.object.get('href'))
