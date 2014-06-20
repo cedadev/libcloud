@@ -78,11 +78,20 @@ import os
 from xml.sax.saxutils import escape as sax_utils_escape
 
 # Convert execute script into format compatible for dispatch over the REST API
-cust_script_char_conv = lambda script_str: sax_utils_escape(script_str).\
+cust_script_char_conv = lambda script_str: script_str.\
 replace(os.linesep, '&#13;').\
 replace('"', '&quot;').\
 replace('%', '&#37;').\
 replace("'", '&apos;')
+
+# A fudge to allow for the fact that ElementTree.tostring will convert ampersand
+# characters previously set as part of the escape sequences set by
+# cust_script_char_conv().  This lambda correct these prior to dispatch
+cust_xml_char_conv_et_fix = lambda xml_str: xml_str.\
+replace('&amp;#13;', '&#13;').\
+replace('&amp;quot;', '&quot;').\
+replace('&amp;#37;', '&#37;').\
+replace('&amp;apos;', '&apos;')
 
 
 class Vdc(object):
@@ -2194,11 +2203,11 @@ class VCloud_5_5_NodeDriver(VCloud_5_1_NodeDriver):
                     admin_auto_logon_count_elem.text = '0'
             
             # End v5.5 fixes
-            open('/Users/philipkershaw/vm_script3.out', 'w').write(ET.tostring(res.object, method='xml'))
+
             # Update VM's GuestCustomizationSection
             res = self.connection.request(
                 '%s/guestCustomizationSection' % get_url_path(vm.get('href')),
-                data=ET.tostring(res.object),
+                data=cust_xml_char_conv_et_fix(ET.tostring(res.object)),
                 method='PUT',
                 headers={'Content-Type': 
                 'application/vnd.vmware.vcloud.guestCustomizationSection+xml'}
